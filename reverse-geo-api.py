@@ -13,8 +13,52 @@ import psycopg2
 import psycopg2.extras
 import re
 import time
+import os
 
 app = Flask(__name__)
+
+# --------------------------------------------------------------------------- #
+# Load Environment Variables                                                     #
+# --------------------------------------------------------------------------- #
+
+# Load from .env file if it exists
+if os.path.exists('.env'):
+    with open('.env') as f:
+        for line in f:
+            if line.strip() and '=' in line:
+                key, value = line.strip().split('=', 1)
+                os.environ[key] = value
+
+# --------------------------------------------------------------------------- #
+# Database Configuration                                                         #
+# --------------------------------------------------------------------------- #
+
+# Get database config from environment variables (required)
+try:
+    DB_NAME = os.environ["DB_NAME"]
+    DB_USER = os.environ["DB_USER"]
+    DB_PASSWORD = os.environ["DB_PASSWORD"]
+    DB_HOST = os.environ["DB_HOST"]
+    DB_PORT = os.environ["DB_PORT"]
+except KeyError as e:
+    missing_var = str(e).strip("'")
+    print(f"[ERROR] Missing required environment variable: {missing_var}")
+    print("[ERROR] Please create a .env file with the required database configuration:")
+    print("[ERROR]   DB_NAME=your_database_name")
+    print("[ERROR]   DB_USER=your_username")
+    print("[ERROR]   DB_PASSWORD=your_password")
+    print("[ERROR]   DB_HOST=your_host_or_localhost")
+    print("[ERROR]   DB_PORT=your_port_or_5432")
+    print("[ERROR]   Copy .env.example to .env and update the values.")
+    exit(1)
+
+# Get Flask server configuration from environment variables (optional)
+FLASK_HOST = os.environ.get("FLASK_HOST", "127.0.0.1")
+FLASK_PORT = int(os.environ.get("FLASK_PORT", "5111"))
+FLASK_DEBUG = os.environ.get("FLASK_DEBUG", "True").lower() == "true"
+
+print(f"[startup] Database config: {DB_USER}@{DB_HOST}:{DB_PORT}/{DB_NAME}")
+print(f"[startup] Flask server: {FLASK_HOST}:{FLASK_PORT} (debug={FLASK_DEBUG})")
 
 # --------------------------------------------------------------------------- #
 # Connection                                                                   #
@@ -34,8 +78,14 @@ def get_conn():
     return _conn
 
 def _new_conn():
+    connection_string = f"dbname={DB_NAME} user={DB_USER} password={DB_PASSWORD}"
+    if DB_HOST != "localhost":
+        connection_string += f" host={DB_HOST} port={DB_PORT}"
+    else:
+        connection_string += f" port={DB_PORT}"
+    
     c = psycopg2.connect(
-        "dbname=ph_geodata user=postgres password=philippogi123",
+        connection_string,
         application_name="reverse_geocoder"
     )
     c.autocommit = True
@@ -543,4 +593,4 @@ def ensure_indexes():
 
 if __name__ == '__main__':
     ensure_indexes()
-    app.run(debug=True, port=5111)
+    app.run(host=FLASK_HOST, port=FLASK_PORT, debug=FLASK_DEBUG)
