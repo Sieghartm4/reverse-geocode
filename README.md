@@ -91,6 +91,7 @@ time                 # Performance timing (built-in)
 ```
 
 Install with:
+
 ```bash
 pip install flask psycopg2-binary psycopg2-extras
 ```
@@ -137,11 +138,13 @@ gunicorn -w 4 reverse-geo-api:app -b 0.0.0.0:5111
 **GET** `/reverse?lat={latitude}&lon={longitude}`
 
 Example:
+
 ```bash
 curl "http://localhost:5111/reverse?lat=14.3258395&lon=121.0136624"
 ```
 
 Response:
+
 ```json
 {
   "data": {
@@ -174,8 +177,23 @@ Response:
 **GET** `/debug?lat={latitude}&lon={longitude}`
 
 Shows raw OSM data for debugging:
+
 ```bash
 curl "http://localhost:5111/debug?lat=14.3258395&lon=121.0136624"
+```
+
+### API Docs
+
+OpenAPI documentation is available in the browser:
+
+```bash
+http://localhost:5111/docs
+```
+
+The raw OpenAPI spec is available at:
+
+```bash
+http://localhost:5111/openapi.json
 ```
 
 ## 🔧 Performance Optimization
@@ -201,10 +219,10 @@ CREATE INDEX idx_osm_polygon_way ON planet_osm_polygon USING GIST(way);
 
 ### Database Tables
 
-| Table | Purpose | Key Columns |
-|-------|---------|-------------|
-| `planet_osm_point` | Address nodes, POIs | `tags` (hstore), `way` |
-| `planet_osm_line` | Roads, paths | `highway`, `name`, `way` |
+| Table                | Purpose               | Key Columns                      |
+| -------------------- | --------------------- | -------------------------------- |
+| `planet_osm_point`   | Address nodes, POIs   | `tags` (hstore), `way`           |
+| `planet_osm_line`    | Roads, paths          | `highway`, `name`, `way`         |
 | `planet_osm_polygon` | Buildings, boundaries | `building`, `admin_level`, `way` |
 
 ### Address Extraction Logic
@@ -229,6 +247,7 @@ CREATE INDEX idx_osm_polygon_way ON planet_osm_polygon USING GIST(way);
 ### Subdivision Detection
 
 Recognizes common Philippine subdivision keywords:
+
 - village, subdivision, phase, estate, compound
 - homes, residences, heights, springs, gardens
 
@@ -281,6 +300,7 @@ WantedBy=multi-user.target
 ```
 
 Enable and start:
+
 ```bash
 sudo systemctl enable reverse-geocode
 sudo systemctl start reverse-geocode
@@ -305,6 +325,7 @@ server {
 ```
 
 Enable:
+
 ```bash
 sudo ln -s /etc/nginx/sites-available/reverse-geocode /etc/nginx/sites-enabled/
 sudo nginx -t && sudo systemctl reload nginx
@@ -312,12 +333,12 @@ sudo nginx -t && sudo systemctl reload nginx
 
 ## 📊 Storage Requirements
 
-| Component | Size |
-|-----------|------|
-| OSM PBF file | ~250MB |
-| PostgreSQL database | ~2-4GB |
-| Indexes | ~1-2GB |
-| **Total** | **~5GB** |
+| Component           | Size     |
+| ------------------- | -------- |
+| OSM PBF file        | ~250MB   |
+| PostgreSQL database | ~2-4GB   |
+| Indexes             | ~1-2GB   |
+| **Total**           | **~5GB** |
 
 ## 🔧 Troubleshooting
 
@@ -358,6 +379,7 @@ This project is open-source. Please comply with OpenStreetMap data licensing req
 ## 📞 Support
 
 For issues and questions:
+
 - Check the debug endpoint for data inspection
 - Review PostgreSQL logs
 - Verify OSM data quality for your target area
