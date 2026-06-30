@@ -1,4 +1,31 @@
+# =====================================================================
+# Frontend & Node.js (Vite + React)
+# =====================================================================
+# Ignore heavy dependencies in the frontend folder
+frontend/node_modules/
+node_modules/
+
+# Ignore production build outputs
+frontend/dist/
+frontend/dist-ssr/
+dist/
+
+# Vite/Frontend environment files (keep your secrets safe!)
+frontend/.env.local
+frontend/.env.*.local
+frontend/*.local
+
+# Frontend logs and caches
+frontend/.eslintcache
+frontend/npm-debug.log*
+frontend/yarn-debug.log*
+frontend/yarn-error.log*
+frontend/pnpm-debug.log*
+.vite/
+
+# =====================================================================
 # Byte-compiled / optimized / DLL files
+# =====================================================================
 __pycache__/
 *.py[cod]
 *$py.class

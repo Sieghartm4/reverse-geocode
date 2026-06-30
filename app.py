@@ -26,7 +26,7 @@ PostgreSQL tuning (add to postgresql.conf, then reload):
   # Also run periodically: ANALYZE planet_osm_polygon; ANALYZE planet_osm_line; ANALYZE planet_osm_point;
 """
 
-from flask import Flask, request, jsonify
+from flask import Flask, request, jsonify, make_response, Response
 import psycopg2
 import psycopg2.extras
 from psycopg2 import pool as pg_pool
@@ -36,88 +36,37 @@ import re
 import time
 import os
 import json
+import math
+import hashlib
+from difflib import SequenceMatcher
+import gzip
+import io
+import tempfile
+import shutil
 
 app = Flask(__name__)
 
-OPENAPI_SPEC = {
-    "openapi": "3.0.3",
-    "info": {
-        "title": "Philippines Reverse Geocoding API",
-        "version": "1.0.0",
-        "description": "Reverse geocode Philippine coordinates using OSM/PostGIS data."
-    },
-    "servers": [{"url": "/"}],
-    "paths": {
-        "/reverse": {
-            "get": {
-                "summary": "Reverse geocode coordinates",
-                "parameters": [
-                    {
-                        "name": "lat",
-                        "in": "query",
-                        "required": True,
-                        "schema": {"type": "number", "format": "double"},
-                        "description": "Latitude of the location."
-                    },
-                    {
-                        "name": "lon",
-                        "in": "query",
-                        "required": True,
-                        "schema": {"type": "number", "format": "double"},
-                        "description": "Longitude of the location."
-                    }
-                ],
-                "responses": {
-                    "200": {
-                        "description": "Successful reverse geocode result",
-                        "content": {
-                            "application/json": {
-                                "schema": {"type": "object"}
-                            }
-                        }
-                    },
-                    "400": {
-                        "description": "Invalid latitude or longitude"
-                    }
-                }
-            }
-        },
-        "/debug": {
-            "get": {
-                "summary": "Inspect raw OSM data for a location",
-                "parameters": [
-                    {
-                        "name": "lat",
-                        "in": "query",
-                        "required": True,
-                        "schema": {"type": "number", "format": "double"},
-                        "description": "Latitude of the location."
-                    },
-                    {
-                        "name": "lon",
-                        "in": "query",
-                        "required": True,
-                        "schema": {"type": "number", "format": "double"},
-                        "description": "Longitude of the location."
-                    }
-                ],
-                "responses": {
-                    "200": {
-                        "description": "Debug information from raw OSM tables",
-                        "content": {
-                            "application/json": {
-                                "schema": {"type": "object"}
-                            }
-                        }
-                    },
-                    "400": {
-                        "description": "Invalid latitude or longitude"
-                    }
-                }
-            }
-        }
-    }
-}
+# Tile cache directory (stores gzipped MVT payloads). Set TILE_CACHE_DIR env to enable.
+TILE_CACHE_DIR = os.environ.get('TILE_CACHE_DIR', 'tile_cache')
+if TILE_CACHE_DIR:
+    try:
+        os.makedirs(TILE_CACHE_DIR, exist_ok=True)
+    except Exception:
+        TILE_CACHE_DIR = None
+
+@app.after_request
+def add_cors_headers(response):
+    origin = request.headers.get('Origin')
+
+    if CORS_ALLOWED_ORIGINS is None:
+        response.headers['Access-Control-Allow-Origin'] = '*'
+    elif origin in CORS_ALLOWED_ORIGINS:
+        response.headers['Access-Control-Allow-Origin'] = origin
+        response.headers['Vary'] = 'Origin'
+
+    response.headers['Access-Control-Allow-Methods'] = CORS_METHODS
+    response.headers['Access-Control-Allow-Headers'] = CORS_HEADERS
+    return response
 
 # --------------------------------------------------------------------------- #
 # Load Environment Variables                                                   #
@@ -153,12 +102,30 @@ except KeyError as e:
 
 # Pool size: raise maxconn if you run more Gunicorn workers
 # Rule of thumb: maxconn = num_workers * 5  (never exceed postgres max_connections)
+# Default is higher for tile-heavy workloads on the dev server.
 POOL_MIN = int(os.environ.get("DB_POOL_MIN", "4"))
-POOL_MAX = int(os.environ.get("DB_POOL_MAX", "20"))
+POOL_MAX = int(os.environ.get("DB_POOL_MAX", "50"))
 
 FLASK_HOST  = os.environ.get("FLASK_HOST",  "127.0.0.1")
 FLASK_PORT  = int(os.environ.get("FLASK_PORT",  "5111"))
 FLASK_DEBUG = os.environ.get("FLASK_DEBUG", "False").lower() == "true"
+
+# CORS settings can be configured via .env. Defaults allow any origin
+# so frontend dev servers and local backend requests will work.
+CORS_ORIGIN_RAW  = os.environ.get("CORS_ORIGIN", "*")
+CORS_METHODS = os.environ.get("CORS_METHODS", "GET,OPTIONS")
+CORS_HEADERS = os.environ.get("CORS_HEADERS", "Content-Type,Authorization")
+
+APP_VERSION = os.environ.get("APP_VERSION", "1.0.0")
+
+# Support either wildcard (*) or a comma-separated allow-list of origins.
+# If any entry is *, we treat it as allow-all. Otherwise we echo back the request Origin
+# only when it matches an allowed origin.
+raw_origins = [origin.strip() for origin in CORS_ORIGIN_RAW.split(",") if origin.strip()]
+if any(origin == "*" for origin in raw_origins) or CORS_ORIGIN_RAW.strip().lower() == "any":
+    CORS_ALLOWED_ORIGINS = None
+else:
+    CORS_ALLOWED_ORIGINS = set(raw_origins)
 
 print(f"[startup] Database config: {DB_USER}@{DB_HOST}:{DB_PORT}/{DB_NAME}")
 print(f"[startup] Pool: min={POOL_MIN} max={POOL_MAX}")
@@ -195,17 +162,30 @@ def get_pool() -> pg_pool.ThreadedConnectionPool:
 def db_cursor():
     """Grab a connection from the pool, yield a RealDictCursor, return it on exit."""
     pool = get_pool()
-    conn = pool.getconn()
+    conn = None
+    returned = False
+
+    for attempt in range(3):
+        try:
+            conn = pool.getconn()
+            break
+        except pg_pool.PoolError:
+            if attempt == 2:
+                raise
+            time.sleep(0.1)
+
     try:
         conn.autocommit = True
         with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as c:
             yield c
     except Exception:
-        # If the connection is broken, discard it so the pool replaces it
-        pool.putconn(conn, close=True)
+        if conn is not None:
+            pool.putconn(conn, close=True)
+            returned = True
         raise
-    else:
-        pool.putconn(conn)
+    finally:
+        if conn is not None and not returned:
+            pool.putconn(conn)
 
 
 # --------------------------------------------------------------------------- #
@@ -264,6 +244,28 @@ def _tv(tags, key: str) -> str:
         return (tags.get(key) or "").strip()
     m = re.search(rf'{re.escape(key)}=>"([^"]*)"', str(tags))
     return m.group(1).strip() if m else ""
+
+
+def _webmercator_tile_bounds(z: int, x: int, y: int):
+    n = 2 ** z
+    lon_min = x / n * 360.0 - 180.0
+    lon_max = (x + 1) / n * 360.0 - 180.0
+
+    def lat_deg(tile_y):
+        rad = math.pi * (1 - 2 * tile_y / n)
+        return math.degrees(math.atan(math.sinh(rad)))
+
+    lat_max = lat_deg(y)
+    lat_min = lat_deg(y + 1)
+
+    def merc_x(lon):
+        return 6378137.0 * math.radians(lon)
+
+    def merc_y(lat):
+        rad = math.radians(lat)
+        return 6378137.0 * math.log(math.tan(math.pi / 4 + rad / 2))
+
+    return merc_x(lon_min), merc_y(lat_min), merc_x(lon_max), merc_y(lat_max)
 
 
 _BLK_RE  = re.compile(r'\b(?:Blk|Block|B)\.?\s*(\w+)',                re.IGNORECASE)
@@ -479,6 +481,107 @@ def fetch_all_cached(lon: float, lat: float) -> dict:
 
 
 # --------------------------------------------------------------------------- #
+# Cached search DB helper
+# --------------------------------------------------------------------------- #
+@lru_cache(maxsize=1024)
+def _search_db_cached(token_tuple: tuple) -> str:
+    """Run unified search query and return JSON-serialised rows list.
+    Caches by token tuple for better hit rates than pattern strings.
+    Combines polygons, points, and lines into single efficient query.
+    """
+    # Join tokens into single pattern for searching (like the original)
+    pattern = f"%{'%'.join(token_tuple)}%"
+    
+    with db_cursor() as c:
+        # UNION all three tables in one query to reduce DB round-trips
+        c.execute("""
+            (
+                SELECT name,
+                       COALESCE(place,
+                                CASE WHEN boundary = 'administrative' THEN 'administrative'
+                                     WHEN landuse IS NOT NULL THEN 'area'
+                                     ELSE 'polygon' END) AS type,
+                       ST_X(ST_Transform(ST_Centroid(way), 4326)) AS lon,
+                       ST_Y(ST_Transform(ST_Centroid(way), 4326)) AS lat,
+                       ST_XMin(ST_Transform(way, 4326)) AS min_lon,
+                       ST_YMin(ST_Transform(way, 4326)) AS min_lat,
+                       ST_XMax(ST_Transform(way, 4326)) AS max_lon,
+                       ST_YMax(ST_Transform(way, 4326)) AS max_lat,
+                       tags->'addr:street' AS addr_street,
+                       tags->'addr:suburb' AS addr_suburb,
+                       tags->'addr:neighbourhood' AS addr_neighbourhood,
+                       tags->'place' AS place_tag,
+                       tags->'addr:city' AS addr_city,
+                       tags->'addr:province' AS addr_province,
+                       tags->'addr:region' AS addr_region,
+                       3 AS priority
+                FROM planet_osm_polygon
+                WHERE name IS NOT NULL AND name ILIKE %s
+                ORDER BY ST_Area(way) DESC
+                LIMIT 20
+            )
+            UNION ALL
+            (
+                SELECT name,
+                       COALESCE(place, tags->'amenity', tags->'shop', tags->'tourism', 'point') AS type,
+                       ST_X(ST_Transform(way, 4326)) AS lon,
+                       ST_Y(ST_Transform(way, 4326)) AS lat,
+                       NULL AS min_lon, NULL AS min_lat, NULL AS max_lon, NULL AS max_lat,
+                       tags->'addr:street' AS addr_street,
+                       tags->'addr:suburb' AS addr_suburb,
+                       tags->'addr:neighbourhood' AS addr_neighbourhood,
+                       tags->'place' AS place_tag,
+                       tags->'addr:city' AS addr_city,
+                       tags->'addr:province' AS addr_province,
+                       tags->'addr:region' AS addr_region,
+                       1 AS priority
+                FROM planet_osm_point
+                WHERE name IS NOT NULL AND name ILIKE %s
+                ORDER BY name ASC
+                LIMIT 15
+            )
+            UNION ALL
+            (
+                SELECT DISTINCT ON (name)
+                       name,
+                       COALESCE(highway, 'road') AS type,
+                       ST_X(ST_Centroid(ST_Transform(ST_Collect(way), 4326))) AS lon,
+                       ST_Y(ST_Centroid(ST_Transform(ST_Collect(way), 4326))) AS lat,
+                       ST_XMin(ST_Extent(ST_Transform(way, 4326))) AS min_lon,
+                       ST_YMin(ST_Extent(ST_Transform(way, 4326))) AS min_lat,
+                       ST_XMax(ST_Extent(ST_Transform(way, 4326))) AS max_lon,
+                       ST_YMax(ST_Extent(ST_Transform(way, 4326))) AS max_lat,
+                       tags->'addr:street' AS addr_street,
+                       tags->'addr:suburb' AS addr_suburb,
+                       tags->'addr:neighbourhood' AS addr_neighbourhood,
+                       tags->'place' AS place_tag,
+                       tags->'addr:city' AS addr_city,
+                       tags->'addr:province' AS addr_province,
+                       tags->'addr:region' AS addr_region,
+                       2 AS priority
+                FROM planet_osm_line
+                WHERE name IS NOT NULL AND name ILIKE %s
+                GROUP BY name, highway, tags
+                ORDER BY name
+                LIMIT 10
+            )
+            ORDER BY priority, name
+            LIMIT 45
+        """, (pattern, pattern, pattern))
+        results = c.fetchall() or []
+
+    # Convert to plain python objects
+    def _clean(obj):
+        if isinstance(obj, list):
+            return [_clean(i) for i in obj]
+        if hasattr(obj, 'items'):
+            return {k: _clean(v) for k, v in obj.items()}
+        return obj
+
+    return json.dumps(_clean(results))
+
+
+# --------------------------------------------------------------------------- #
 # Optional Redis cache (multi-worker shared cache)                            #
 # Uncomment and set REDIS_URL in .env to enable.                              #
 # --------------------------------------------------------------------------- #
@@ -665,159 +768,33 @@ def assemble_address(d: dict) -> dict:
 
 
 # --------------------------------------------------------------------------- #
-# /reverse                                                                     #
+# API endpoints are implemented in api/*.py (registered as blueprints below)
 # --------------------------------------------------------------------------- #
 
-@app.route('/reverse', methods=['GET'])
-def reverse_geocode():
-    t0 = time.perf_counter()
-    try:
-        lat = float(request.args.get('lat'))
-        lon = float(request.args.get('lon'))
-    except (TypeError, ValueError):
-        return jsonify({"error": "Invalid lat/lon"}), 400
-
-    d    = fetch_all_cached(lon, lat)
-    addr = assemble_address(d)
-    elapsed = round((time.perf_counter() - t0) * 1000, 1)
-
-    print(
-        f"[geocode] {elapsed}ms | blk={addr['block']!r} lot={addr['lot']!r} "
-        f"unit={addr['unit']!r} house={addr['house_number']!r} bldg={addr['building']!r} "
-        f"road={addr['road']!r} hood={addr['neighbourhood']!r} brgy={addr['suburb']!r} "
-        f"city={addr['city']!r} state={addr['state']!r} pc={addr['postcode']!r}"
-    )
-
-    return jsonify({
-        "data": {
-            "display_name": addr["display_name"],
-            "elapsed_ms":   elapsed,
-            "address": {
-                "unit":          addr["unit"],
-                "block":         addr["block"],
-                "lot":           addr["lot"],
-                "house_number":  addr["house_number"],
-                "building":      addr["building"],
-                "road":          addr["road"],
-                "neighbourhood": addr["neighbourhood"],
-                "suburb":        addr["suburb"],
-                "district":      addr["district"],
-                "city":          addr["city"],
-                "county":        addr["county"],
-                "state":         addr["state"],
-                "region":        addr["region"],
-                "postcode":      addr["postcode"],
-                "country":       "Philippines",
-                "country_code":  "ph",
-            }
-        }
-    })
 
 
-# --------------------------------------------------------------------------- #
-# /debug                                                                       #
-# --------------------------------------------------------------------------- #
 
-@app.route('/debug', methods=['GET'])
-def debug():
-    try:
-        lat = float(request.args.get('lat'))
-        lon = float(request.args.get('lon'))
-    except (TypeError, ValueError):
-        return jsonify({"error": "Invalid lat/lon"}), 400
+# Expose shared helpers/constants on Flask app so api/ modules can access them
+app.fetch_all_cached = fetch_all_cached
+app.assemble_address = assemble_address
+app._search_db_cached = _search_db_cached
+app._webmercator_tile_bounds = _webmercator_tile_bounds
+app._pt = _pt
+app.db_cursor = db_cursor
+app.TILE_CACHE_DIR = TILE_CACHE_DIR
+app.APP_VERSION = APP_VERSION
 
-    pt  = _pt(lon, lat)
-    out = {}
+# Register API blueprints from the api/ package
+from api import reverse_bp, search_bp, tiles_bp, cities_bp, debug_bp, meta_bp, fonts_bp, docs_bp
 
-    with db_cursor() as c:
-        c.execute(f"""
-            SELECT name, building, tags,
-                   ST_Contains(way, {pt}) AS exact,
-                   ST_Distance(way, {pt}) AS dist_m
-            FROM planet_osm_polygon
-            WHERE building IS NOT NULL
-              AND way && ST_Expand({pt}, 150)
-              AND ST_DWithin(way, {pt}, 150)
-            ORDER BY exact DESC, dist_m ASC
-            LIMIT 10
-        """)
-        out["buildings"] = [dict(r) for r in (c.fetchall() or [])]
-
-        c.execute(f"""
-            SELECT name, tags,
-                   ST_Distance(way, {pt}) AS dist_m
-            FROM planet_osm_point
-            WHERE way && ST_Expand({pt}, 300)
-              AND ST_DWithin(way, {pt}, 300)
-            ORDER BY dist_m
-            LIMIT 15
-        """)
-        out["nearby_points"] = [dict(r) for r in (c.fetchall() or [])]
-
-        c.execute(f"""
-            SELECT name, admin_level, place, tags
-            FROM planet_osm_polygon
-            WHERE way IS NOT NULL
-              AND way && ST_Expand({pt}, 200000)
-              AND ST_Contains(way, {pt})
-              AND (admin_level IS NOT NULL
-                   OR place IN ('city','municipality','town','village',
-                                'suburb','quarter','neighbourhood'))
-            ORDER BY ST_Area(way) ASC
-            LIMIT 15
-        """)
-        out["admin_boundaries"] = [dict(r) for r in (c.fetchall() or [])]
-
-        c.execute(f"""
-            SELECT name, highway,
-                   ST_Distance(way, {pt}) AS dist_m
-            FROM planet_osm_line
-            WHERE name IS NOT NULL
-              AND highway IS NOT NULL
-              AND way && ST_Expand({pt}, 300)
-              AND ST_DWithin(way, {pt}, 300)
-            ORDER BY dist_m
-            LIMIT 10
-        """)
-        out["roads"] = [dict(r) for r in (c.fetchall() or [])]
-
-    return jsonify(out)
-
-
-@app.route('/openapi.json', methods=['GET'])
-def openapi_spec():
-    return jsonify(OPENAPI_SPEC)
-
-
-@app.route('/docs', methods=['GET'])
-def swagger_ui():
-    return '''<!DOCTYPE html>
-<html lang="en">
-<head>
-  <meta charset="UTF-8" />
-  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-  <title>Reverse Geocode API Docs</title>
-  <link rel="stylesheet" href="https://unpkg.com/swagger-ui-dist@4/swagger-ui.css" />
-</head>
-<body>
-  <div id="swagger-ui"></div>
-  <script src="https://unpkg.com/swagger-ui-dist@4/swagger-ui-bundle.js"></script>
-  <script src="https://unpkg.com/swagger-ui-dist@4/swagger-ui-standalone-preset.js"></script>
-  <script>
-    window.UI = SwaggerUIBundle({
-      url: '/openapi.json',
-      dom_id: '#swagger-ui',
-      presets: [
-        SwaggerUIBundle.presets.apis,
-        SwaggerUIStandalonePreset
-      ],
-      layout: 'BaseLayout',
-      deepLinking: true
-    });
-  </script>
-</body>
-</html>'''
-
+app.register_blueprint(reverse_bp)
+app.register_blueprint(search_bp)
+app.register_blueprint(tiles_bp)
+app.register_blueprint(cities_bp)
+app.register_blueprint(debug_bp)
+app.register_blueprint(meta_bp)
+app.register_blueprint(fonts_bp)
+app.register_blueprint(docs_bp)
 
 # --------------------------------------------------------------------------- #
 # Spatial indexes (run once at startup)                                        #
