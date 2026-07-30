@@ -17,42 +17,62 @@ def tile(z, x, y):
 
     include_points = False
     if z < 7:
-        polygon_filter = "(place IS NOT NULL OR landuse IS NOT NULL OR building IS NOT NULL OR boundary = 'administrative')"
-        road_filter = "highway IN ('motorway','trunk','primary','secondary')"
+        polygon_filter = "(place IS NOT NULL OR landuse IS NOT NULL OR tags ? 'natural' OR tags ? 'water' OR building IS NOT NULL OR boundary = 'administrative')"
+        line_filter = "(highway IN ('motorway','trunk','primary','secondary') OR tags ? 'waterway')"
         admin_max = 4
     elif z < 10:
-        polygon_filter = "(place IS NOT NULL OR landuse IS NOT NULL)"
-        road_filter = "highway IN ('motorway','trunk','primary','secondary')"
+        polygon_filter = "(place IS NOT NULL OR landuse IS NOT NULL OR tags ? 'natural' OR tags ? 'water')"
+        line_filter = "(highway IN ('motorway','trunk','primary','secondary') OR tags ? 'waterway')"
         admin_max = 6
     elif z < 13:
-        polygon_filter = "(place IS NOT NULL OR landuse IS NOT NULL OR building IS NOT NULL)"
-        road_filter = "highway IN ('motorway','trunk','primary','secondary','tertiary')"
+        polygon_filter = "(place IS NOT NULL OR landuse IS NOT NULL OR tags ? 'natural' OR tags ? 'water' OR building IS NOT NULL)"
+        line_filter = "(highway IN ('motorway','trunk','primary','secondary','tertiary') OR tags ? 'waterway')"
         admin_max = 8
         include_points = True
     elif z < 16:
-        polygon_filter = "(building IS NOT NULL OR place IS NOT NULL OR landuse IS NOT NULL)"
-        road_filter = "highway IS NOT NULL"
+        polygon_filter = "(building IS NOT NULL OR place IS NOT NULL OR landuse IS NOT NULL OR tags ? 'natural' OR tags ? 'water')"
+        line_filter = "(highway IS NOT NULL OR tags ? 'waterway')"
         admin_max = 10
         include_points = True
     else:
-        polygon_filter = "(building IS NOT NULL OR place IS NOT NULL OR landuse IS NOT NULL)"
-        road_filter = "highway IS NOT NULL"
+        polygon_filter = "(building IS NOT NULL OR place IS NOT NULL OR landuse IS NOT NULL OR tags ? 'natural' OR tags ? 'water')"
+        line_filter = "(highway IS NOT NULL OR tags ? 'waterway')"
         admin_max = 12
         include_points = True
+
+    def mvt_select(type_expr, place_expr, landuse_expr, natural_expr, water_expr,
+                   highway_expr, amenity_expr, admin_level_expr, waterway_expr, geom_expr):
+        return f"""
+                SELECT osm_id::text AS id,
+                       {type_expr} AS _type,
+                       name,
+                       {place_expr},
+                       {landuse_expr},
+                       {natural_expr},
+                       {water_expr},
+                       {highway_expr},
+                       {amenity_expr},
+                       {admin_level_expr},
+                       {waterway_expr},
+                       ST_AsMVTGeom({geom_expr}, {envelope}, 4096, 256, TRUE) AS geom
+        """
 
     point_sql = ''
     if include_points:
         point_sql = f"""
                 UNION ALL
-                SELECT osm_id::text AS id,
-                       'point' AS _type,
-                       name,
-                       NULL::text AS place,
-                       NULL::text AS landuse,
-                       NULL::text AS highway,
-                       tags->'amenity' AS amenity,
-                       NULL::text AS admin_level,
-                       ST_AsMVTGeom(way, {envelope}, 4096, 256, TRUE) AS geom
+                {mvt_select(
+                    "'point'",
+                    'NULL::text AS place',
+                    'NULL::text AS landuse',
+                    'NULL::text AS natural',
+                    'NULL::text AS water',
+                    'NULL::text AS highway',
+                    "tags->'amenity' AS amenity",
+                    'NULL::text AS admin_level',
+                    'NULL::text AS waterway',
+                    'way'
+                )}
                 FROM planet_osm_point
                 WHERE way && {envelope}
                   AND ST_Intersects(way, {envelope})
@@ -61,15 +81,18 @@ def tile(z, x, y):
 
     admin_sql = f"""
                 UNION ALL
-                SELECT osm_id::text AS id,
-                       'polygon' AS _type,
-                       name,
-                       NULL::text AS place,
-                       NULL::text AS landuse,
-                       NULL::text AS highway,
-                       NULL::text AS amenity,
-                       admin_level::text AS admin_level,
-                       ST_AsMVTGeom(ST_SimplifyPreserveTopology(way, {simplify_tolerance}), {envelope}, 4096, 256, TRUE) AS geom
+                {mvt_select(
+                    "'polygon'",
+                    'NULL::text AS place',
+                    'NULL::text AS landuse',
+                    'NULL::text AS natural',
+                    'NULL::text AS water',
+                    'NULL::text AS highway',
+                    'NULL::text AS amenity',
+                    'admin_level::text AS admin_level',
+                    'NULL::text AS waterway',
+                    f'ST_SimplifyPreserveTopology(way, {simplify_tolerance})'
+                )}
                 FROM planet_osm_polygon
                 WHERE boundary = 'administrative'
                   AND admin_level IS NOT NULL
@@ -91,14 +114,16 @@ def tile(z, x, y):
                 if_none = request.headers.get('If-None-Match')
                 if if_none and if_none == etag:
                     resp = make_response('', 304)
-                    resp.headers['Cache-Control'] = 'public, max-age=3600'
+                    resp.headers['Cache-Control'] = 'public, max-age=86400'
                     resp.headers['ETag'] = etag
+                    resp.headers['X-Cache'] = 'HIT'
                     return resp
                 resp = Response(compressed, mimetype='application/vnd.mapbox-vector-tile')
                 resp.headers['Content-Encoding'] = 'gzip'
                 resp.headers['Vary'] = 'Accept-Encoding'
-                resp.headers['Cache-Control'] = 'public, max-age=3600'
+                resp.headers['Cache-Control'] = 'public, max-age=86400'
                 resp.headers['ETag'] = etag
+                resp.headers['X-Cache'] = 'HIT'
                 return resp
             except Exception:
                 pass
@@ -111,9 +136,12 @@ def tile(z, x, y):
                        name,
                        place,
                        landuse,
+                       tags->'natural' AS natural,
+                       tags->'water' AS water,
                        NULL::text AS highway,
                        NULL::text AS amenity,
                        NULL::text AS admin_level,
+                       NULL::text AS waterway,
                        ST_AsMVTGeom(ST_SimplifyPreserveTopology(way, {simplify_tolerance}), {envelope}, 4096, 256, TRUE) AS geom
                 FROM planet_osm_polygon
                 WHERE way && {envelope}
@@ -121,18 +149,21 @@ def tile(z, x, y):
                   AND {polygon_filter}
                 UNION ALL
                 SELECT osm_id::text AS id,
-                       'road' AS _type,
+                       CASE WHEN tags ? 'waterway' THEN 'waterway' ELSE 'road' END AS _type,
                        name,
                        NULL::text AS place,
                        NULL::text AS landuse,
-                       highway,
+                       NULL::text AS natural,
+                       NULL::text AS water,
+                       highway::text AS highway,
                        NULL::text AS amenity,
                        NULL::text AS admin_level,
+                       tags->'waterway' AS waterway,
                        ST_AsMVTGeom(ST_SimplifyPreserveTopology(way, {simplify_tolerance}), {envelope}, 4096, 256, TRUE) AS geom
                 FROM planet_osm_line
                 WHERE way && {envelope}
                   AND ST_Intersects(way, {envelope})
-                  AND {road_filter}
+                  AND {line_filter}
                 {point_sql}
                 {admin_sql}
             ) AS tile
@@ -176,6 +207,7 @@ def tile(z, x, y):
     resp = Response(compressed, mimetype='application/vnd.mapbox-vector-tile')
     resp.headers['Content-Encoding'] = 'gzip'
     resp.headers['Vary'] = 'Accept-Encoding'
-    resp.headers['Cache-Control'] = 'public, max-age=3600'
+    resp.headers['Cache-Control'] = 'public, max-age=86400'
     resp.headers['ETag'] = etag
+    resp.headers['X-Cache'] = 'MISS'
     return resp

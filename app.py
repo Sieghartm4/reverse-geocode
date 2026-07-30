@@ -31,7 +31,9 @@ import psycopg2
 import psycopg2.extras
 from psycopg2 import pool as pg_pool
 from contextlib import contextmanager
+from collections import deque
 from functools import lru_cache
+from threading import Lock
 import re
 import time
 import os
@@ -46,7 +48,8 @@ import shutil
 
 app = Flask(__name__)
 
-# Tile cache directory (stores gzipped MVT payloads). Set TILE_CACHE_DIR env to enable.
+# Disk-backed tile cache for vector tiles.
+# Set TILE_CACHE_DIR='' or unset to disable.
 TILE_CACHE_DIR = os.environ.get('TILE_CACHE_DIR', 'tile_cache')
 if TILE_CACHE_DIR:
     try:
@@ -67,6 +70,59 @@ def add_cors_headers(response):
     response.headers['Access-Control-Allow-Methods'] = CORS_METHODS
     response.headers['Access-Control-Allow-Headers'] = CORS_HEADERS
     return response
+
+def _rate_limit_config():
+    if request.path.startswith('/tiles') or request.path.startswith('/fonts'):
+        return RATE_LIMIT_REQUESTS_TILES
+    return RATE_LIMIT_REQUESTS
+
+
+def _rate_limit_bucket_key(client_ip: str) -> tuple[str, str]:
+    if request.path.startswith('/tiles') or request.path.startswith('/fonts'):
+        return (client_ip, 'tiles')
+    return (client_ip, 'api')
+
+
+@app.before_request
+def enforce_rate_limit():
+    req_limit = _rate_limit_config()
+    if req_limit <= 0:
+        return None
+
+    xff = request.headers.get('X-Forwarded-For', '')
+    client_ip = xff.split(',')[0].strip() if xff else (request.remote_addr or 'unknown')
+    now = time.monotonic()
+    bucket_key = _rate_limit_bucket_key(client_ip)
+
+    with _rate_limit_lock:
+        bucket = _rate_limit_store.setdefault(bucket_key, deque())
+        while bucket and bucket[0] <= now - RATE_LIMIT_WINDOW:
+            bucket.popleft()
+
+        if len(bucket) >= req_limit:
+            retry_after = int(bucket[0] + RATE_LIMIT_WINDOW - now) if bucket else RATE_LIMIT_WINDOW
+            response = jsonify({
+                'error': 'Rate limit exceeded',
+                'retry_after_seconds': retry_after,
+            })
+            response.status_code = 429
+            response.headers['Retry-After'] = str(retry_after)
+            response.headers['X-RateLimit-Limit'] = str(req_limit)
+            response.headers['X-RateLimit-Remaining'] = '0'
+            response.headers['X-RateLimit-Reset'] = str(int(now + retry_after))
+            return response
+
+        bucket.append(now)
+
+@app.after_request
+def add_rate_limit_headers(response):
+    if RATE_LIMIT_REQUESTS > 0:
+        response.headers.setdefault('X-RateLimit-Limit', str(RATE_LIMIT_REQUESTS))
+    return response
+
+
+_rate_limit_store: dict[str, deque[float]] = {}
+_rate_limit_lock = Lock()
 
 # --------------------------------------------------------------------------- #
 # Load Environment Variables                                                   #
@@ -103,8 +159,8 @@ except KeyError as e:
 # Pool size: raise maxconn if you run more Gunicorn workers
 # Rule of thumb: maxconn = num_workers * 5  (never exceed postgres max_connections)
 # Default is higher for tile-heavy workloads on the dev server.
-POOL_MIN = int(os.environ.get("DB_POOL_MIN", "4"))
-POOL_MAX = int(os.environ.get("DB_POOL_MAX", "50"))
+POOL_MIN = int(os.environ.get("DB_POOL_MIN", "10"))
+POOL_MAX = int(os.environ.get("DB_POOL_MAX", "80"))
 
 FLASK_HOST  = os.environ.get("FLASK_HOST",  "127.0.0.1")
 FLASK_PORT  = int(os.environ.get("FLASK_PORT",  "5111"))
@@ -127,9 +183,19 @@ if any(origin == "*" for origin in raw_origins) or CORS_ORIGIN_RAW.strip().lower
 else:
     CORS_ALLOWED_ORIGINS = set(raw_origins)
 
+RATE_LIMIT_REQUESTS = int(os.environ.get("RATE_LIMIT_REQUESTS", "60"))
+RATE_LIMIT_REQUESTS_TILES = int(os.environ.get("RATE_LIMIT_REQUESTS_TILES", "600"))
+RATE_LIMIT_WINDOW = int(os.environ.get("RATE_LIMIT_WINDOW", "60"))
+SLOW_QUERY_THRESHOLD_MS = float(os.environ.get("SLOW_QUERY_THRESHOLD_MS", "100.0"))
+GEO_CACHE_SIZE = int(os.environ.get("GEO_CACHE_SIZE", "4096"))
+SEARCH_CACHE_SIZE = int(os.environ.get("SEARCH_CACHE_SIZE", "2048"))
+
 print(f"[startup] Database config: {DB_USER}@{DB_HOST}:{DB_PORT}/{DB_NAME}")
 print(f"[startup] Pool: min={POOL_MIN} max={POOL_MAX}")
 print(f"[startup] Flask server: {FLASK_HOST}:{FLASK_PORT} (debug={FLASK_DEBUG})")
+print(f"[startup] Rate limiting: {RATE_LIMIT_REQUESTS} req/{RATE_LIMIT_WINDOW}s per IP")
+print(f"[startup] Tile rate limiting: {RATE_LIMIT_REQUESTS_TILES} req/{RATE_LIMIT_WINDOW}s per IP")
+print(f"[startup] Geo cache size: {GEO_CACHE_SIZE}, Search cache size: {SEARCH_CACHE_SIZE}")
 
 # --------------------------------------------------------------------------- #
 # Connection Pool  (replaces single _conn global)                             #
@@ -140,6 +206,30 @@ def _build_dsn() -> str:
     if DB_HOST:
         dsn += f" host={DB_HOST}"
     return dsn
+
+
+type _Cursor = psycopg2.extras.RealDictCursor
+
+class ProfilingCursor(psycopg2.extras.RealDictCursor):
+    def _log_query(self, query, elapsed):
+        ms = elapsed * 1000.0
+        if ms >= SLOW_QUERY_THRESHOLD_MS:
+            q = ' '.join(str(query).strip().split())
+            print(f"[query] {ms:.1f}ms slow query (>{SLOW_QUERY_THRESHOLD_MS}ms): {q[:320]}")
+
+    def execute(self, query, vars=None):
+        t0 = time.perf_counter()
+        try:
+            return super().execute(query, vars)
+        finally:
+            self._log_query(query, time.perf_counter() - t0)
+
+    def executemany(self, query, vars_list):
+        t0 = time.perf_counter()
+        try:
+            return super().executemany(query, vars_list)
+        finally:
+            self._log_query(query, time.perf_counter() - t0)
 
 
 _pool: pg_pool.ThreadedConnectionPool | None = None
@@ -176,7 +266,7 @@ def db_cursor():
 
     try:
         conn.autocommit = True
-        with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as c:
+        with conn.cursor(cursor_factory=ProfilingCursor) as c:
             yield c
     except Exception:
         if conn is not None:
@@ -460,7 +550,7 @@ def fetch_all(lon: float, lat: float) -> dict:
 # For a shared cache across workers, swap to Redis (see comment below).       #
 # --------------------------------------------------------------------------- #
 
-@lru_cache(maxsize=2048)
+@lru_cache(maxsize=GEO_CACHE_SIZE)
 def _fetch_all_cached(lon_r: float, lat_r: float) -> str:
     """Returns JSON-serialised fetch_all result (lru_cache requires hashable args)."""
     result = fetch_all(lon_r, lat_r)
@@ -483,18 +573,26 @@ def fetch_all_cached(lon: float, lat: float) -> dict:
 # --------------------------------------------------------------------------- #
 # Cached search DB helper
 # --------------------------------------------------------------------------- #
-@lru_cache(maxsize=1024)
+@lru_cache(maxsize=SEARCH_CACHE_SIZE)
 def _search_db_cached(token_tuple: tuple) -> str:
     """Run unified search query and return JSON-serialised rows list.
     Caches by token tuple for better hit rates than pattern strings.
     Combines polygons, points, and lines into single efficient query.
     """
-    # Join tokens into single pattern for searching (like the original)
-    pattern = f"%{'%'.join(token_tuple)}%"
+    if not token_tuple:
+        return json.dumps([])
+
+    search_field = "concat_ws(' ', name, tags->'addr:city', tags->'addr:province', tags->'addr:region')"
+    token_patterns = [f"%{token}%" for token in token_tuple]
+    token_clause = ' AND '.join([
+        f"({search_field} ILIKE %s)"
+        for _ in token_patterns
+    ])
+    params = [pattern for pattern in token_patterns]
     
     with db_cursor() as c:
         # UNION all three tables in one query to reduce DB round-trips
-        c.execute("""
+        c.execute(f"""
             (
                 SELECT name,
                        COALESCE(place,
@@ -516,7 +614,7 @@ def _search_db_cached(token_tuple: tuple) -> str:
                        tags->'addr:region' AS addr_region,
                        3 AS priority
                 FROM planet_osm_polygon
-                WHERE name IS NOT NULL AND name ILIKE %s
+                WHERE name IS NOT NULL AND {token_clause}
                 ORDER BY ST_Area(way) DESC
                 LIMIT 20
             )
@@ -536,7 +634,7 @@ def _search_db_cached(token_tuple: tuple) -> str:
                        tags->'addr:region' AS addr_region,
                        1 AS priority
                 FROM planet_osm_point
-                WHERE name IS NOT NULL AND name ILIKE %s
+                WHERE name IS NOT NULL AND {token_clause}
                 ORDER BY name ASC
                 LIMIT 15
             )
@@ -560,14 +658,14 @@ def _search_db_cached(token_tuple: tuple) -> str:
                        tags->'addr:region' AS addr_region,
                        2 AS priority
                 FROM planet_osm_line
-                WHERE name IS NOT NULL AND name ILIKE %s
+                WHERE name IS NOT NULL AND {token_clause}
                 GROUP BY name, highway, tags
                 ORDER BY name
                 LIMIT 10
             )
             ORDER BY priority, name
             LIMIT 45
-        """, (pattern, pattern, pattern))
+        """, params * 3)
         results = c.fetchall() or []
 
     # Convert to plain python objects

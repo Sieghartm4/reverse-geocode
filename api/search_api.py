@@ -1,6 +1,7 @@
 from flask import Blueprint, request, jsonify, current_app
 from difflib import SequenceMatcher
 import json
+import re
 import time
 
 search_bp = Blueprint('search', __name__)
@@ -56,8 +57,8 @@ def search():
             elapsed = round((time.perf_counter() - t0) * 1000, 1)
             return jsonify({'results': [], 'elapsed_ms': elapsed})
 
-    # Tokenize for better LIKE matching (faster than multiple ILIKE)
-    tokens = query.split()
+    # Tokenize for better LIKE matching and ignore commas/separators.
+    tokens = [token for token in re.split(r"[\s,]+", query) if token]
     if len(tokens) > 3:
         tokens = tokens[:3]  # Limit tokens for DB performance
     

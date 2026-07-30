@@ -1,12 +1,44 @@
-@import 'maplibre-gl/dist/maplibre-gl.css';
+@import "maplibre-gl/dist/maplibre-gl.css";
 
 @tailwind base;
 @tailwind components;
 @tailwind utilities;
 
-html, body, #root {
+:root {
+  --bg: #0b1220;
+  --panel-bg: #16233a;
+  --text: #f3efe4;
+  --border: #3a4d6b;
+  --muted: #94a3b8;
+  --btn-bg: var(--panel-bg);
+  --btn-color: var(--text);
+  --btn-hover-bg: rgba(255, 255, 255, 0.04);
+  --accent: #f59e0b;
+  --toggle-dark-bg: #0b1220;
+  --toggle-light-bg: #ffffff;
+}
+
+[data-theme="light"] {
+  --bg: #f8fafc;
+  --panel-bg: #ffffff;
+  --text: #0f172a;
+  --border: #e2e8f0;
+  --muted: #475569;
+  --btn-bg: var(--panel-bg);
+  --btn-color: var(--text);
+  --btn-hover-bg: rgba(0, 0, 0, 0.06);
+}
+
+html,
+body,
+#root {
   height: 100%;
   margin: 0;
+  background: var(--bg);
+  color: var(--text);
+  transition:
+    background-color 200ms ease,
+    color 200ms ease;
 }
 
 .maplibregl-ctrl-attrib {
@@ -14,14 +46,113 @@ html, body, #root {
 }
 
 .maplibregl-popup-content {
-  background: #16233a;
-  color: #f3efe4;
-  border: 1px solid #3a4d6b;
+  background: var(--panel-bg);
+  color: var(--text);
+  border: 1px solid var(--border);
   border-radius: 0.375rem;
-  font-family: 'Inter', system-ui, sans-serif;
+  font-family: "Inter", system-ui, sans-serif;
 }
 
 .maplibregl-popup-tip {
-  border-top-color: #16233a !important;
-  border-bottom-color: #16233a !important;
+  border-top-color: var(--panel-bg) !important;
+  border-bottom-color: var(--panel-bg) !important;
+}
+
+/* Map project-specific utility classes to theme variables */
+.border-chart-line {
+  border-color: var(--border) !important;
+}
+.text-paper {
+  color: var(--text) !important;
+}
+.text-chart-500 {
+  color: var(--muted) !important;
+}
+.text-chart-600 {
+  color: rgba(0, 0, 0, 0.6) !important;
+}
+.bg-chart-800\/95 {
+  background-color: var(--panel-bg) !important;
+}
+.bg-chart-700\/70 {
+  background-color: var(--panel-bg) !important;
+}
+.hover\:bg-chart-700\/70:hover {
+  background-color: var(--panel-bg) !important;
+}
+.shadow-2xl {
+  box-shadow: 0 25px 50px -12px rgba(2, 6, 23, 0.6);
+}
+.divide-chart-line > * + * {
+  border-top-color: var(--border) !important;
+}
+.placeholder\:text-chart-500::placeholder {
+  color: var(--muted) !important;
+}
+
+/* Buttons using text-paper + panel bg for better contrast */
+.btn-theme {
+  background: var(--btn-bg);
+  color: var(--btn-color);
+  border: 1px solid var(--border);
+  padding: 6px 8px;
+  border-radius: 6px;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  cursor: pointer;
+  transition:
+    background-color 120ms ease,
+    color 120ms ease,
+    transform 80ms ease;
+}
+
+.btn-theme svg {
+  width: 16px;
+  height: 16px;
+  display: block;
+}
+.btn-theme:hover {
+  background: var(--btn-hover-bg);
+  transform: translateY(-1px);
+}
+.btn-theme:active {
+  transform: translateY(0);
+}
+
+/* Styles for when the button shows the moon (switch to dark) */
+.btn-theme--moon {
+  background: var(--toggle-dark-bg) !important;
+  color: var(--accent) !important;
+  border: none !important;
+  border-radius: 0 !important;
+}
+.btn-theme--moon:hover {
+  background: var(--toggle-dark-bg) !important;
+  transform: none !important;
+}
+
+/* Styles for when the button shows the sun (switch to light) */
+.btn-theme--sun {
+  background: var(--toggle-light-bg) !important;
+  color: var(--accent) !important;
+  border: none !important;
+  border-radius: 0 !important;
+}
+.btn-theme--sun:hover {
+  background: var(--toggle-light-bg) !important;
+  transform: none !important;
+}
+
+/* Lay out top-right controls horizontally so custom button sits beside nav */
+.maplibregl-ctrl-top-right {
+  display: flex;
+  gap: 0.5rem;
+  align-items: center;
+  flex-direction: row;
+}
+
+.maplibregl-ctrl-group {
+  display: flex;
+  flex-direction: column;
 }

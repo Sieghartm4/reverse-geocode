@@ -100,16 +100,14 @@ pip install flask psycopg2-binary psycopg2-extras
 
 ### Database Connection
 
-Edit the database connection in `reverse-geo-api.py`:
+Configure the database connection using `.env` or environment variables:
 
-```python
-def _new_conn():
-    c = psycopg2.connect(
-        "dbname=ph_geodata user=postgres password=yourpassword",
-        application_name="reverse_geocoder"
-    )
-    c.autocommit = True
-    return c
+```bash
+DB_NAME=ph_geodata
+DB_USER=postgres
+DB_PASSWORD=your_password
+DB_HOST=localhost
+DB_PORT=5432
 ```
 
 ### Update Password
@@ -121,14 +119,25 @@ Replace `yourpassword` with your actual PostgreSQL password.
 ### Development Mode
 
 ```bash
-python reverse-geo-api.py
+WAITRESS_THREADS=32 python waitress_run.py
 ```
 
 ### Production Mode
 
 ```bash
-pip install gunicorn
-gunicorn -w 4 reverse-geo-api:app -b 0.0.0.0:5111
+pip install gunicorn gevent
+gunicorn -c gunicorn.conf.py app:app
+```
+
+Optional environment variables:
+
+```bash
+GUNICORN_WORKERS=9
+GUNICORN_WORKER_CONNECTIONS=100
+RATE_LIMIT_REQUESTS=60
+RATE_LIMIT_WINDOW=60
+GEO_CACHE_SIZE=4096
+SEARCH_CACHE_SIZE=2048
 ```
 
 ## 📡 API Endpoints

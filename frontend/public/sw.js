@@ -1,11 +1,13 @@
 const CACHE_NAME = "reverse-geocode-tile-cache-v1";
+const MAX_CACHE_ENTRIES = 300;
 
 const shouldCacheRequest = (request) => {
   if (request.method !== "GET") return false;
   try {
     const url = new URL(request.url);
     return (
-      url.pathname.startsWith("/tiles/") || url.pathname.startsWith("/fonts/")
+      url.origin === self.location.origin &&
+      (url.pathname.startsWith("/tiles/") || url.pathname.startsWith("/fonts/"))
     );
   } catch (err) {
     return false;
@@ -17,7 +19,21 @@ self.addEventListener("install", (event) => {
 });
 
 self.addEventListener("activate", (event) => {
-  event.waitUntil(self.clients.claim());
+  event.waitUntil(
+    caches
+      .keys()
+      .then((cacheNames) =>
+        Promise.all(
+          cacheNames.map((cacheName) => {
+            if (cacheName !== CACHE_NAME) {
+              return caches.delete(cacheName);
+            }
+            return null;
+          }),
+        ),
+      )
+      .then(() => self.clients.claim()),
+  );
 });
 
 self.addEventListener("fetch", (event) => {
@@ -33,7 +49,8 @@ self.addEventListener("fetch", (event) => {
       try {
         const response = await fetch(event.request);
         if (response.ok) {
-          cache.put(event.request, response.clone());
+          await cache.put(event.request, response.clone());
+          trimCache(cache, MAX_CACHE_ENTRIES);
         }
         return response;
       } catch (err) {
@@ -42,3 +59,13 @@ self.addEventListener("fetch", (event) => {
     }),
   );
 });
+
+async function trimCache(cache, maxEntries) {
+  const keys = await cache.keys();
+  if (keys.length <= maxEntries) return;
+
+  const deleteCount = keys.length - maxEntries;
+  for (let i = 0; i < deleteCount; i += 1) {
+    await cache.delete(keys[i]);
+  }
+}

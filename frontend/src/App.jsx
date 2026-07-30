@@ -11,6 +11,20 @@ export default function App() {
   const [clickError, setClickError] = useState("");
   const [lastSelected, setLastSelected] = useState(null);
   const [mapReady, setMapReady] = useState(false);
+  const [theme, setTheme] = useState(() => {
+    try {
+      return localStorage.getItem("theme") || "dark";
+    } catch (e) {
+      return "dark";
+    }
+  });
+
+  useEffect(() => {
+    try {
+      document.documentElement.setAttribute("data-theme", theme);
+      localStorage.setItem("theme", theme);
+    } catch (e) {}
+  }, [theme]);
 
   useEffect(() => {
     const id = setInterval(() => {
@@ -146,13 +160,12 @@ export default function App() {
 
   return (
     <div className="relative h-screen w-screen overflow-hidden font-sans">
-      <MapView ref={mapRef} onMapClick={handleMapClick} />
-
-      {/* Debug banner to show last selection and map readiness */}
-      <div className="absolute top-2 right-2 bg-chart-800/90 text-xs text-chart-400 px-3 py-1 rounded-md border border-chart-line z-50">
-        <div>Selected: {lastSelected || "—"}</div>
-        <div>Map ready: {mapReady ? "yes" : "no"}</div>
-      </div>
+      <MapView
+        ref={mapRef}
+        theme={theme}
+        onMapClick={handleMapClick}
+        onToggleTheme={() => setTheme((t) => (t === "dark" ? "light" : "dark"))}
+      />
 
       <div className="absolute top-4 left-4 right-4 flex flex-col sm:flex-row gap-3 items-start">
         <SearchBar

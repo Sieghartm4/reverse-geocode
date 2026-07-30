@@ -14,9 +14,15 @@ export default defineConfig(({ mode }) => {
     try {
       const url = new URL(env.VITE_FRONTEND_URL);
       host = url.hostname;
-      port = url.port ? parseInt(url.port) : (url.protocol === "https:" ? 443 : 80);
+      port = url.port
+        ? parseInt(url.port)
+        : url.protocol === "https:"
+          ? 443
+          : 80;
     } catch (e) {
-      console.warn("Invalid VITE_FRONTEND_URL, falling back to host/port settings");
+      console.warn(
+        "Invalid VITE_FRONTEND_URL, falling back to host/port settings",
+      );
     }
   }
 
@@ -26,11 +32,43 @@ export default defineConfig(({ mode }) => {
     port = parseInt(env.VITE_PORT_FRONTEND) || 5173;
   }
 
+  const proxyTarget = env.VITE_API_BACKEND || "";
+  const proxy = proxyTarget
+    ? {
+        "/tiles": {
+          target: proxyTarget,
+          changeOrigin: true,
+          secure: false,
+        },
+        "/fonts": {
+          target: proxyTarget,
+          changeOrigin: true,
+          secure: false,
+        },
+        "/reverse": {
+          target: proxyTarget,
+          changeOrigin: true,
+          secure: false,
+        },
+        "/search": {
+          target: proxyTarget,
+          changeOrigin: true,
+          secure: false,
+        },
+        "/cities": {
+          target: proxyTarget,
+          changeOrigin: true,
+          secure: false,
+        },
+      }
+    : undefined;
+
   return {
     plugins: [react()],
     server: {
       host,
       port,
+      proxy,
     },
     envDir: path.resolve(__dirname, ".."),
   };

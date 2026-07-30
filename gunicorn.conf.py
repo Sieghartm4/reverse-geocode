@@ -7,8 +7,8 @@ import os
 # ── Workers ───────────────────────────────────────────────────────────────────
 # gevent workers handle many concurrent I/O-bound requests per worker
 worker_class       = "gevent"
-worker_connections = 100                            # concurrent greenlets per worker
-workers            = multiprocessing.cpu_count() * 2 + 1  # e.g. 4-core → 9 workers
+worker_connections = int(os.environ.get("GUNICORN_WORKER_CONNECTIONS", "100"))
+workers            = int(os.environ.get("GUNICORN_WORKERS", multiprocessing.cpu_count() * 2 + 1))
 
 # ── Binding ───────────────────────────────────────────────────────────────────
 host = os.environ.get("FLASK_HOST", "0.0.0.0")
