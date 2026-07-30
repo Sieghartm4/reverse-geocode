@@ -193,3 +193,6 @@ postgres_data/
 # Performance and profiling files
 *.prof
 *.profile
+
+# Tile cache (generated vector tiles)
+tile_cache/
